@@ -163,6 +163,7 @@ async function scanFile(filePath: string): Promise<ScanResult[]> {
 
     for (let lineNum = 0; lineNum < lines.length; lineNum++) {
       const line = lines[lineNum];
+      if (line === undefined) continue;
       const secrets = findSecretsInText(line);
 
       for (const secret of secrets) {
@@ -181,7 +182,7 @@ async function scanFile(filePath: string): Promise<ScanResult[]> {
     return results;
   } catch (error) {
     // Don't error on missing files - just skip them
-    if (error.code !== 'ENOENT') {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
       console.error(`Error scanning file ${filePath}: ${error}`);
     }
     return [];

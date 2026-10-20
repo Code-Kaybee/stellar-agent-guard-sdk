@@ -943,7 +943,7 @@ export async function fetchGuardPolicyAndWindow(
 
   try {
     // Attempt to get both entries in one RPC call for ledger consistency
-    const response = await server.getLedgerEntries([policyKey, windowKey]);
+    const response = await server.getLedgerEntries(policyKey, windowKey);
     const entries = response.entries ?? [];
 
     // Initialize entries as undefined
