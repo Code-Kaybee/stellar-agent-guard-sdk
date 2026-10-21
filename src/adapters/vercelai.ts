@@ -19,6 +19,7 @@
  * | `admissible`   | the wrapped `execute` runs and its result is returned untouched |
  * | `blocked`      | throws `GuardBlockedError` before `execute` is entered          |
  * | `undetermined` | throws `PreFlightUndeterminedError` before `execute` is entered |
+ * | mapper failure | throws `PreFlightUndeterminedError` (cause: `AdapterMappingError`) before `execute` is entered |
  *
  * Throwing (rather than returning a marker like the LangChain `ToolMessage`) is
  * the harness's documented contract for this adapter: the AI SDK renders a
@@ -32,7 +33,13 @@ import { GuardBlockedError } from "../reasons.ts";
 import { PreFlightUndeterminedError } from "../preflight.ts";
 import type { PreFlightDecision, PreFlightInterceptor } from "../preflight.ts";
 import type { ContractCall } from "../tx.ts";
-import { mapContractCalls } from "./shared.ts";
+import {
+  checkOptionsFor,
+  mapContractCalls,
+  mappingFailureFor,
+  runDecisionHook,
+  type BlockedHookLogger,
+} from "./shared.ts";
 
 /**
  * The subset of the Vercel AI SDK's `Tool` interface this adapter reads.
@@ -65,8 +72,34 @@ export interface VercelAIGuardOptions {
    * `execute` runs (all-or-nothing).
    */
   toContractCalls?: (call: VercelAIToolCallInput) => readonly ContractCall[] | null;
-  /** Observe every decision — the place to wire telemetry. */
+  /**
+   * Observe every decision — the place to wire telemetry.
+   *
+   * The observer is **advisory**: an exception it throws is swallowed, and can
+   * never change whether the guard permits `execute` to run (issue #277).
+   * Reporting a decision is not part of the verdict, so a broken log sink must
+   * not turn an admissible call into a failure nor rescue a blocked one. This
+   * matches the SDK's other failure-isolated callbacks (`onGap`,
+   * `onStep`/`onUnknownTopics`).
+   */
   onDecision?: (call: VercelAIToolCallInput, decision: PreFlightDecision) => void;
+  /**
+   * Explicit sink for a swallowed `onDecision` failure. Omitted (the default),
+   * a throwing or rejecting observer is silent (issue #313/#314).
+   */
+  blockedHookLogger?: BlockedHookLogger;
+  /**
+   * Caller-owned cancellation, forwarded to every pre-flight `check()`
+   * (issue #315). The AI SDK's tool `execute` receives its own `abortSignal`;
+   * pass it here if you have it at wrap time.
+   */
+  signal?: AbortSignal | undefined;
+  /**
+   * Bound on each RPC call made by the pre-flight check, in milliseconds
+   * (issue #315); `0` disables it. A fired timeout yields the same fail-closed
+   * `undetermined` verdict as an abort.
+   */
+  timeoutMs?: number | undefined;
 }
 
 /**
@@ -87,19 +120,44 @@ export function wrapToolWithGuard<T extends VercelAIToolLike>(
     ...tool,
     async execute(input: never, toolOptions: unknown): Promise<unknown> {
       const request = { toolName: call.toolName, input };
-      const contractCalls = mapContractCalls(request, options);
+      let contractCalls: ContractCall[];
+      try {
+        contractCalls = mapContractCalls(request, options);
+      } catch (error) {
+        // Fail closed on a mapper failure (issue #316). This adapter documents
+        // `undetermined` as a thrown PreFlightUndeterminedError, so the mapping
+        // failure keeps that shape with the AdapterMappingError as its cause.
+        const failure = mappingFailureFor("vercelai", error);
+        throw new PreFlightUndeterminedError(failure.info.explanation, {
+          cause: failure.decision.error,
+        });
+      }
       if (contractCalls.length === 0) return execute(input, toolOptions);
 
+      const checkOptions = checkOptionsFor(options);
+
       if (contractCalls.length === 1) {
-        const decision = await options.interceptor.check(contractCalls[0]!);
-        options.onDecision?.(request, decision);
+        const decision = await options.interceptor.check(contractCalls[0]!, checkOptions);
+        runDecisionHook(
+          options.onDecision,
+          [request, decision],
+          "vercelai",
+          options.blockedHookLogger,
+        );
         if (decision.allowed) return execute(input, toolOptions);
         throw refusalFor(decision, contractCalls[0]!);
       }
 
       // Batch mapping: only an all-admissible batch reaches `execute`.
-      const batch = await options.interceptor.checkBatch(contractCalls);
-      for (const verdict of batch.verdicts) options.onDecision?.(request, verdict);
+      const batch = await options.interceptor.checkBatch(contractCalls, checkOptions);
+      for (const verdict of batch.verdicts) {
+        runDecisionHook(
+          options.onDecision,
+          [request, verdict],
+          "vercelai",
+          options.blockedHookLogger,
+        );
+      }
       if (batch.admissible) return execute(input, toolOptions);
 
       const index = batch.verdicts.findIndex((verdict) => !verdict.allowed);

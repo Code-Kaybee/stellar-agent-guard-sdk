@@ -10,15 +10,19 @@ import {
   InvalidInputError,
   PreFlightInterceptor,
   PreFlightUndeterminedError,
+  preflight,
+  preflightBatch,
   validateContractCall,
   type PreFlightCacheOptions,
   type PreFlightDecision,
 } from "../../src/preflight.ts";
 import { RpcTimeoutError } from "../../src/invoke.ts";
+import { ContractResponseError } from "../../src/errors.ts";
 import { GuardBlockedError } from "../../src/reasons.ts";
 import type { PolicyConfig } from "../../src/policy.ts";
 import type { ContractCall } from "../../src/tx.ts";
 import { unsafeContractAddress, unsafeAccountAddress } from "../../src/policy.ts";
+import { mulberry32, randomUint } from "./seeded-random.ts";
 
 const VALID_GUARD = unsafeContractAddress("CAPADGEK457RHKN4RYVUMDJTFHDSG7R5HREQONKLYK7MFKC5WFENPP44");
 const VALID_TOKEN = unsafeContractAddress("CDCYDGBGS5AZ5BZS6XY2SK2PHJHSOEGTN3N4INCK34KF6GU2BGC7Z6MB");
@@ -89,6 +93,7 @@ function createMockServer(options?: {
       return (
         options?.simulateResponse ?? {
           minResourceFee: "100",
+          latestLedger: 123_456,
           result: {
             auth: [],
           },
@@ -112,6 +117,33 @@ function createTestInterceptor(server: rpc.Server) {
     source: Keypair.random(),
   });
 }
+
+describe("one-shot pre-flight helpers", () => {
+  function config() {
+    return {
+      server: createMockServer(),
+      networkPassphrase: "Test SDF Network ; September 2015",
+      guard: VALID_GUARD,
+      agent: Keypair.random(),
+      source: Keypair.random(),
+    };
+  }
+
+  it("preflight() constructs an interceptor and checks one call", async () => {
+    const decision = await preflight(config(), validTransferCall());
+    assert.equal(decision.kind, "admissible");
+    assert.equal(
+      decision.kind === "admissible" ? decision.provenance?.ledger : undefined,
+      123_456,
+    );
+  });
+
+  it("preflightBatch() constructs an interceptor and checks a batch", async () => {
+    const decision = await preflightBatch(config(), []);
+    assert.equal(decision.overallAdmissible, true);
+    assert.equal(decision.calls.length, 0);
+  });
+});
 
 describe("validateContractCall validator unit tests", () => {
   describe("contract format validation", () => {
@@ -471,6 +503,99 @@ describe("boundary: valid-but-unusual inputs proceed to simulation", () => {
   });
 });
 
+describe("simulation ledger provenance (#347)", () => {
+  it("reports the ledger from the same simulation that produced the quote", async () => {
+    const mockServer = createMockServer();
+    const interceptor = createTestInterceptor(mockServer);
+
+    const decision = await interceptor.check(validTransferCall());
+
+    assert.equal(decision.kind, "admissible");
+    assert.deepEqual(decision.kind === "admissible" ? decision.provenance : undefined, {
+      ledger: 123_456,
+    });
+  });
+
+  it("omits provenance rather than inventing one when the response has no ledger", async () => {
+    const mockServer = createMockServer({
+      simulateResponse: {
+        minResourceFee: "100",
+        result: { auth: [] },
+        transactionData: {
+          getReadOnly: () => [],
+          getReadWrite: () => [],
+        },
+      },
+    });
+    const interceptor = createTestInterceptor(mockServer);
+
+    const decision = await interceptor.check(validTransferCall());
+
+    assert.equal(decision.kind, "admissible");
+    assert.equal(
+      decision.kind === "admissible" ? decision.provenance : "not-admissible",
+      undefined,
+    );
+  });
+
+  it("omits a malformed ledger instead of passing it through", async () => {
+    for (const latestLedger of [-1, 1.5, Number.NaN, "123", null]) {
+      const mockServer = createMockServer({
+        simulateResponse: {
+          minResourceFee: "100",
+          latestLedger,
+          result: { auth: [] },
+          transactionData: {
+            getReadOnly: () => [],
+            getReadWrite: () => [],
+          },
+        },
+      });
+      const interceptor = createTestInterceptor(mockServer);
+
+      const decision = await interceptor.check(validTransferCall());
+
+      assert.equal(decision.kind, "admissible");
+      assert.equal(
+        decision.kind === "admissible" ? decision.provenance : "not-admissible",
+        undefined,
+        `expected ${String(latestLedger)} to be omitted`,
+      );
+    }
+  });
+
+  it("never performs an additional ledger read to label the quote", async () => {
+    let latestLedgerCalls = 0;
+    const server = {
+      getAccount: async () => ({ sequenceNumber: () => "100" }),
+      getLatestLedger: async () => {
+        latestLedgerCalls += 1;
+        return { sequence: 999_999 };
+      },
+      simulateTransaction: async () => ({
+        minResourceFee: "100",
+        latestLedger: 500_000,
+        result: { auth: [] },
+        transactionData: {
+          getReadOnly: () => [],
+          getReadWrite: () => [],
+        },
+      }),
+    } as unknown as rpc.Server;
+    const interceptor = createTestInterceptor(server);
+
+    const decision = await interceptor.check(validTransferCall());
+
+    assert.equal(decision.kind, "admissible");
+    assert.deepEqual(decision.kind === "admissible" ? decision.provenance : undefined, {
+      ledger: 500_000,
+    });
+    // The check already reads the current ledger once for its cache context;
+    // provenance must add no further read and must not use that value.
+    assert.equal(latestLedgerCalls, 1, "provenance must come from the pricing simulation");
+  });
+});
+
 describe("throw vs verdict contract asymmetry", () => {
   it("programmer error (invalid input) throws InvalidInputError", async () => {
     const mockServer = createMockServer();
@@ -570,9 +695,64 @@ describe("throw vs verdict contract asymmetry", () => {
 });
 
 /* -------------------------------------------------------------------------- */
-/*             Unit tests for opt-in pre-flight simulation cache              */
+/*             Pre-flight resource-fee handling (fail closed)                 */
 /* -------------------------------------------------------------------------- */
 
+/**
+ * A malformed resource fee must fail the way every other malformed contract
+ * response fails: with the SDK's typed `ContractResponseError`, naming the
+ * field and the stage, and with the verdict `undetermined` — never
+ * `admissible`, because an unpriceable simulation must not produce a budget
+ * decision.
+ */
+describe("pre-flight resource-fee handling", () => {
+  function serverWithFee(minResourceFee: unknown) {
+    return createMockServer({
+      enforcedSimulateResponse: {
+        minResourceFee,
+        result: { auth: [] },
+        transactionData: {
+          getReadOnly: () => [],
+          getReadWrite: () => [],
+        },
+      },
+    });
+  }
+
+  it("reports a missing, malformed, negative or out-of-range fee as undetermined", async () => {
+    for (const value of [undefined, null, "", "not-a-fee", "1.5", -1, 2n ** 64n]) {
+      const server = serverWithFee(value);
+      const interceptor = createTestInterceptor(server);
+
+      const decision = await interceptor.check(validTransferCall());
+
+      assert.equal(decision.kind, "undetermined");
+      assert.ok(
+        decision.error instanceof ContractResponseError,
+        `expected a ContractResponseError for ${String(value)}`,
+      );
+      assert.equal(decision.error.field, "minResourceFee");
+      assert.equal(decision.error.stage, "preflight");
+      assert.equal(decision.allowed, false);
+    }
+  });
+
+  it("accepts the fee in every representation the SDK may hand back", async () => {
+    for (const value of ["42", 42, 42n]) {
+      const server = serverWithFee(value);
+      const interceptor = createTestInterceptor(server);
+
+      const decision = await interceptor.check(validTransferCall());
+
+      assert.equal(decision.kind, "admissible");
+      assert.equal(decision.kind === "admissible" ? decision.estimatedResourceFee : undefined, 42n);
+    }
+  });
+});
+
+/* -------------------------------------------------------------------------- */
+/*             Unit tests for opt-in pre-flight simulation cache              */
+/* -------------------------------------------------------------------------- */
 const CONTRACT = unsafeContractAddress("CAPADGEK457RHKN4RYVUMDJTFHDSG7R5HREQONKLYK7MFKC5WFENPP44");
 const OTHER_CONTRACT = unsafeContractAddress(Address.contract(Buffer.alloc(32)).toString());
 const NETWORK_PASSPHRASE = "Test SDF Network ; September 2015";
@@ -655,6 +835,12 @@ describe("PreFlightInterceptor simulation cache", () => {
     assert.equal(harness.simulations, 2);
     assert.equal(harness.latestLedgerCalls, 3);
     assert.equal(second, first);
+
+    const stats = interceptor.getCacheStats();
+    assert.equal(stats.hits, 1);
+    assert.equal(stats.misses, 1);
+    assert.equal(stats.size, 1);
+    assert.equal(stats.invalidations, 0);
   });
 
   it("supports ledger-based TTL configuration", async () => {
@@ -687,6 +873,12 @@ describe("PreFlightInterceptor simulation cache", () => {
     await interceptor.check(harness.call);
 
     assert.equal(harness.simulations, 4);
+
+    const stats = interceptor.getCacheStats();
+    assert.equal(stats.hits, 0); // first call: miss, invalidate, second call: miss
+    assert.equal(stats.misses, 2); // both calls are misses
+    assert.equal(stats.size, 1); // cache populated by second call after invalidate
+    assert.equal(stats.invalidations, 1); // one invalidation call cleared one entry
   });
 
   it("invalidates only the requested call when one is supplied", async () => {
@@ -716,6 +908,12 @@ describe("PreFlightInterceptor simulation cache", () => {
     await interceptor.check(harness.call);
 
     assert.equal(harness.simulations, 4);
+
+    const stats = interceptor.getCacheStats();
+    assert.equal(stats.hits, 0);
+    assert.equal(stats.misses, 2);
+    assert.equal(stats.size, 1);
+    assert.equal(stats.invalidations, 0);
   });
 
   it("invalidates when the policy revision changes", async () => {
@@ -817,6 +1015,173 @@ describe("PreFlightInterceptor simulation cache", () => {
       () => makeInterceptor(harness, { cache: { ttlMs: 0 } }),
       /ttlMs must be a positive finite number/,
     );
+  });
+});
+
+/* -------------------------------------------------------------------------- */
+
+/**
+ * In-flight coalescing: concurrent checks for the same call share one
+ * discovery/enforcement run, without turning into a durable cache and without
+ * letting one caller's bound cancel another caller's result.
+ */
+describe("PreFlightInterceptor in-flight coalescing", () => {
+  function deferred<T = void>() {
+    let resolve!: (value: T | PromiseLike<T>) => void;
+    let reject!: (reason?: unknown) => void;
+    const promise = new Promise<T>((res, rej) => {
+      resolve = res;
+      reject = rej;
+    });
+    return { promise, resolve, reject };
+  }
+
+  function admissibleSimulation() {
+    return {
+      result: { auth: [] },
+      minResourceFee: "17",
+      transactionData: { getReadOnly: () => [], getReadWrite: () => [{}] },
+    };
+  }
+
+  function makeHarness(options: { rejected?: boolean } = {}) {
+    const source = Keypair.random();
+    const gate = deferred();
+    const probeStarted = deferred();
+    let simulations = 0;
+    const server = {
+      getAccount: async () => new Account(source.publicKey(), "1"),
+      getLatestLedger: async () => ({ sequence: 100 }),
+      simulateTransaction: async () => {
+        simulations += 1;
+        if (simulations === 1) probeStarted.resolve();
+        await gate.promise;
+        return options.rejected ? { error: "HostError: trap" } : admissibleSimulation();
+      },
+    } as unknown as rpc.Server;
+    return {
+      server,
+      source,
+      probeStarted: probeStarted.promise,
+      release: () => gate.resolve(),
+      get simulations() {
+        return simulations;
+      },
+    };
+  }
+
+  function makeInterceptor(harness: ReturnType<typeof makeHarness>) {
+    return new PreFlightInterceptor({
+      server: harness.server,
+      networkPassphrase: NETWORK_PASSPHRASE,
+      guard: VALID_GUARD,
+      agent: harness.source,
+      source: harness.source,
+    });
+  }
+
+  it("runs one discovery/enforcement pass for concurrent identical calls", async () => {
+    const harness = makeHarness();
+    const interceptor = makeInterceptor(harness);
+    const call = validTransferCall(10n);
+
+    const first = interceptor.check(call);
+    const second = interceptor.check(call);
+    await harness.probeStarted;
+    harness.release();
+
+    const [firstDecision, secondDecision] = await Promise.all([first, second]);
+    assert.equal(firstDecision.kind, "admissible");
+    assert.equal(secondDecision.kind, "admissible");
+    // One probe plus one enforced simulation, not two of each.
+    assert.equal(harness.simulations, 2);
+    assert.equal(secondDecision, firstDecision);
+
+    // The settled entry is gone: the next call runs its own pass.
+    await new Promise((resolve) => setImmediate(resolve));
+    const later = await interceptor.check(call);
+    assert.equal(later.kind, "admissible");
+    assert.equal(harness.simulations, 4);
+  });
+
+  it("can be disabled per interceptor", async () => {
+    const harness = makeHarness();
+    const interceptor = new PreFlightInterceptor({
+      server: harness.server,
+      networkPassphrase: NETWORK_PASSPHRASE,
+      guard: VALID_GUARD,
+      agent: harness.source,
+      source: harness.source,
+      coalesceInFlight: false,
+    });
+    const call = validTransferCall(10n);
+
+    const first = interceptor.check(call);
+    const second = interceptor.check(call);
+    harness.release();
+
+    const [firstDecision, secondDecision] = await Promise.all([first, second]);
+    assert.equal(firstDecision.kind, "admissible");
+    assert.equal(secondDecision.kind, "admissible");
+    assert.equal(harness.simulations, 4);
+  });
+
+  it("does not coalesce distinct calls", async () => {
+    const harness = makeHarness();
+    const interceptor = makeInterceptor(harness);
+
+    const first = interceptor.check(validTransferCall(10n));
+    const second = interceptor.check(validTransferCall(20n));
+    harness.release();
+
+    const [firstDecision, secondDecision] = await Promise.all([first, second]);
+    assert.equal(firstDecision.kind, "admissible");
+    assert.equal(secondDecision.kind, "admissible");
+    assert.equal(harness.simulations, 4);
+  });
+
+  it("keeps a waiter's result when another waiter's signal aborts", async () => {
+    const harness = makeHarness();
+    const interceptor = makeInterceptor(harness);
+    const call = validTransferCall(10n);
+    const controller = new AbortController();
+
+    const aborted = interceptor.check(call, { signal: controller.signal });
+    const patient = interceptor.check(call);
+    await harness.probeStarted;
+
+    controller.abort();
+    harness.release();
+
+    const [abortedDecision, patientDecision] = await Promise.all([aborted, patient]);
+    assert.equal(abortedDecision.kind, "undetermined");
+    assert.ok(abortedDecision.error instanceof RpcTimeoutError);
+    assert.equal(abortedDecision.error.aborted, true);
+    // The abort cancelled one waiter's wait, not the shared run.
+    assert.equal(patientDecision.kind, "admissible");
+    assert.equal(harness.simulations, 2);
+  });
+
+  it("removes a rejected run and never persists its undetermined outcome", async () => {
+    const harness = makeHarness({ rejected: true });
+    const interceptor = makeInterceptor(harness);
+    const call = validTransferCall(10n);
+
+    const first = interceptor.check(call);
+    const second = interceptor.check(call);
+    await harness.probeStarted;
+    harness.release();
+
+    const [firstDecision, secondDecision] = await Promise.all([first, second]);
+    assert.equal(firstDecision.kind, "undetermined");
+    assert.equal(secondDecision.kind, "undetermined");
+    assert.equal(harness.simulations, 1);
+
+    // A settled failure is removed, not cached: the next call runs again.
+    await new Promise((resolve) => setImmediate(resolve));
+    const third = await interceptor.check(call);
+    assert.equal(third.kind, "undetermined");
+    assert.equal(harness.simulations, 2);
   });
 });
 
@@ -1056,34 +1421,102 @@ describe("PreFlightInterceptor.checkBatch()", () => {
     );
   });
 
-  it("falls back to a zero committed spend when the ledger read is unavailable", async () => {
-    // No `getLedgerEntries` on the mock: the fetch throws and is swallowed, so
-    // the batch must still run rather than fail closed on a missing read.
+  it("fails closed when a required live staging read fails", async () => {
+    // Without an explicit snapshot, a failed ledger read means the committed
+    // window spend is unknown. Staging against an assumed zero could label an
+    // over-cap batch admissible, so the transfer cannot be decided.
     const harness = batchServer({
       enforcedRuns: [admissibleSimulation("10"), admissibleSimulation("10")],
+      ledgerEntries: () => {
+        throw new Error("rpc unavailable");
+      },
     });
-    const decision = await batchInterceptor(harness.server).checkBatch([
-      transferCall(10n),
-      transferCall(20n),
-    ]);
+    const decision = await batchInterceptor(
+      harness.server,
+      policyWithWindowCap(1_000n),
+    ).checkBatch([transferCall(10n), transferCall(20n)]);
+
+    assert.equal(decision.admissible, false);
+    assert.equal(decision.kind, "undetermined");
+    assert.equal(decision.staging?.source, "unavailable");
+    assert.equal(decision.staging?.windowSpent, null);
+    assert.equal(decision.staging?.unavailable, true);
+    assert.equal(decision.verdicts.length, 2);
+    assert.equal(decision.verdicts[0]?.kind, "undetermined");
+    assert.equal(decision.verdicts[1]?.kind, "undetermined");
+    assert.match(
+      decision.verdicts[0]!.kind === "undetermined" ? decision.verdicts[0]!.detail : "",
+      /committed window spend/,
+    );
+  });
+
+  it("treats an absent Window entry as zero committed spend, not a failed read", async () => {
+    const harness = batchServer({
+      enforcedRuns: [admissibleSimulation("10"), admissibleSimulation("10")],
+      ledgerEntries: () => ({ entries: [] }),
+    });
+    // The policy is supplied (cap 100) but the committed spend is read from the
+    // ledger: an absent entry means 0n, so 60 + 40 lands exactly on the cap.
+    const decision = await batchInterceptor(
+      harness.server,
+      policyWithWindowCap(100n),
+    ).checkBatch([transferCall(60n), transferCall(40n)]);
 
     assert.equal(decision.admissible, true);
-    assert.equal(harness.simulations, 4);
+    assert.equal(decision.kind, "admissible");
+    assert.equal(decision.staging?.source, "absent");
+    assert.equal(decision.staging?.windowSpent, 0n);
+    assert.equal(decision.staging?.unavailable, false);
+  });
+
+  it("trusts an explicitly supplied zero snapshot even when the live read fails", async () => {
+    const harness = batchServer({
+      enforcedRuns: [admissibleSimulation("10"), admissibleSimulation("10")],
+      ledgerEntries: () => {
+        throw new Error("rpc unavailable");
+      },
+    });
+    const decision = await batchInterceptor(
+      harness.server,
+      policyWithWindowCap(1_000n),
+    ).checkBatch([transferCall(10n), transferCall(20n)], { initialWindowSpent: 0n });
+
+    assert.equal(decision.admissible, true);
+    assert.equal(decision.kind, "admissible");
+    assert.equal(decision.staging?.source, "provided");
+    assert.equal(decision.staging?.windowSpent, 0n);
+    assert.equal(decision.staging?.unavailable, false);
+  });
+
+  it("does not need window state for a batch with only non-transfer calls", async () => {
+    const harness = batchServer({
+      enforcedRuns: [admissibleSimulation("10")],
+      ledgerEntries: () => {
+        throw new Error("rpc unavailable");
+      },
+    });
+    const decision = await batchInterceptor(harness.server).checkBatch([
+      { contract: VALID_TOKEN, fn: "balance", args: [new Address(VALID_GUARD).toScVal()] },
+    ]);
+
+    // Staging is not required, so an unavailable window read cannot change the
+    // verdict for a call that never touches the window.
+    assert.equal(decision.admissible, true);
+    assert.equal(decision.kind, "admissible");
+    assert.equal(decision.staging, undefined);
   });
 
   it("reads the live policy and window from ledger storage when none is supplied", async () => {
     // `readPersistentEntry` decodes the contract-data entry's ScVal; the batch
     // check then stages against the committed total it finds there.
-    const { server } = batchServer({
+    const harness = batchServer({
       enforcedRuns: [admissibleSimulation("10")],
-      ledgerEntries: () => {
-        throw new Error("not modelled");
-      },
+      ledgerEntries: () => ({ entries: [] }),
     });
-    // An unreadable policy degrades to "no cap" rather than a fabricated one.
-    const decision = await batchInterceptor(server).checkBatch([transferCall(10n)]);
+    const decision = await batchInterceptor(harness.server).checkBatch([transferCall(10n)]);
 
     assert.equal(decision.admissible, true);
+    assert.equal(decision.staging?.source, "absent");
   });
 
   it("assertBatchAllowed returns the batch when every call is admissible", async () => {
@@ -1125,5 +1558,293 @@ describe("PreFlightInterceptor.checkBatch()", () => {
         return true;
       },
     );
+  });
+
+  it("assertBatchAllowed throws PreFlightUndeterminedError when staging state is unavailable", async () => {
+    const { server } = batchServer({
+      enforcedRuns: [admissibleSimulation("10")],
+      ledgerEntries: () => {
+        throw new Error("rpc unavailable");
+      },
+    });
+    const interceptor = batchInterceptor(server, policyWithWindowCap(1_000n));
+
+    await assert.rejects(
+      interceptor.assertBatchAllowed([transferCall(10n)]),
+      (error: unknown) => {
+        assert.ok(error instanceof PreFlightUndeterminedError);
+        assert.match((error as Error).message, /batch staging state unavailable/);
+        return true;
+      },
+    );
+  });
+
+  /**
+   * Cumulative staging boundaries (issue #337).
+   *
+   * The explicit matrix below pins the three arithmetic boundaries the cap can
+   * have, and the seeded case explores mixed batches so ordering, non-transfer
+   * calls, and individual blocked/undetermined verdicts cannot be averaged
+   * away. The seed is printed in the failure, and the iteration count is kept
+   * small so the mock-RPC suite stays fast in CI.
+   */
+  describe("cumulative staging boundaries (issue #337)", () => {
+    const STAGING_SEED = 0x5eed337;
+    const STAGING_ITERATIONS = 50;
+
+    type ForcedKind = "admissible" | "blocked" | "undetermined";
+
+    interface Member {
+      call: ContractCall;
+      forced: ForcedKind;
+      /** Transfer amount, or `null` for a non-transfer call. */
+      amount: bigint | null;
+    }
+
+    function nonTransferCall(): ContractCall {
+      return {
+        contract: VALID_TOKEN,
+        fn: "balance",
+        args: [new Address(VALID_GUARD).toScVal()],
+      };
+    }
+
+    function forcedRun(kind: ForcedKind): unknown {
+      if (kind === "blocked") return blockedSimulation();
+      if (kind === "undetermined") return { error: "HostError: invalid_input", events: [] };
+      return admissibleSimulation("10");
+    }
+
+    /** Run one batch and return the verdict kinds plus the fee total. */
+    async function runBatch(
+      members: readonly Member[],
+      windowCap: bigint,
+      initialWindowSpent: bigint,
+    ) {
+      const { server } = batchServer({
+        enforcedRuns: members.map((member) => forcedRun(member.forced)),
+      });
+      const decision = await batchInterceptor(server, policyWithWindowCap(windowCap)).checkBatch(
+        members.map((member) => member.call),
+        { initialWindowSpent },
+      );
+      return decision;
+    }
+
+    function expectedVerdicts(
+      members: readonly Member[],
+      windowCap: bigint,
+      initialWindowSpent: bigint,
+    ): { kinds: string[]; fee: bigint } {
+      let staged = 0n;
+      let fee = 0n;
+      const kinds = members.map((member) => {
+        if (member.forced === "blocked") return "blocked";
+        if (member.forced === "undetermined") return "undetermined";
+        if (member.amount !== null && member.amount > 0n && windowCap > 0n) {
+          const projected = initialWindowSpent + staged + member.amount;
+          if (projected > windowCap) return "blocked";
+          staged += member.amount;
+        }
+        fee += 10n;
+        return "admissible";
+      });
+      return { kinds, fee };
+    }
+
+    function describeFailure(
+      seed: number,
+      iteration: number,
+      members: readonly Member[],
+      windowCap: bigint,
+      initialWindowSpent: bigint,
+    ): string {
+      const replay = JSON.stringify(
+        { windowCap, initialWindowSpent, members },
+        (_key, value) => (typeof value === "bigint" ? value.toString() : value),
+      );
+      return `seed 0x${seed.toString(16)} iteration ${iteration}\nbatch: ${replay}`;
+    }
+
+    it("admits below and equal to the cap, and refuses one stroop above", async () => {
+      const cases: Array<{ amounts: bigint[]; expected: string[] }> = [
+        { amounts: [99n], expected: ["admissible"] },
+        { amounts: [100n], expected: ["admissible"] },
+        { amounts: [101n], expected: ["blocked"] },
+        { amounts: [60n, 40n], expected: ["admissible", "admissible"] },
+        { amounts: [60n, 41n], expected: ["admissible", "blocked"] },
+        { amounts: [50n, 49n], expected: ["admissible", "admissible"] },
+        { amounts: [50n, 51n], expected: ["admissible", "blocked"] },
+      ];
+
+      for (const boundary of cases) {
+        const members = boundary.amounts.map(
+          (amount): Member => ({
+            call: transferCall(amount),
+            forced: "admissible",
+            amount,
+          }),
+        );
+        const decision = await runBatch(members, 100n, 0n);
+        assert.deepEqual(
+          decision.verdicts.map((verdict) => verdict.kind),
+          boundary.expected,
+          `amounts ${boundary.amounts.join(" + ")} against cap 100`,
+        );
+        assert.equal(
+          decision.admissible,
+          !boundary.expected.includes("blocked"),
+          "only a fully admissible batch is admissible",
+        );
+      }
+    });
+
+    it("keeps staging order-dependent and ignores non-transfer calls", async () => {
+      const ordered = [
+        { amounts: [101n, 50n], expected: ["blocked", "admissible"] },
+        { amounts: [50n, 101n], expected: ["admissible", "blocked"] },
+        { amounts: [60n, 40n], expected: ["admissible", "admissible"] },
+        { amounts: [60n, 41n], expected: ["admissible", "blocked"] },
+      ];
+
+      for (const boundary of ordered) {
+        const members = boundary.amounts.map(
+          (amount): Member => ({ call: transferCall(amount), forced: "admissible", amount }),
+        );
+        const decision = await runBatch(members, 100n, 0n);
+        assert.deepEqual(
+          decision.verdicts.map((verdict) => verdict.kind),
+          boundary.expected,
+          `ordered amounts ${boundary.amounts.join(", ")}`,
+        );
+      }
+
+      const mixed: Member[] = [
+        { call: transferCall(60n), forced: "admissible", amount: 60n },
+        { call: nonTransferCall(), forced: "admissible", amount: null },
+        { call: transferCall(40n), forced: "admissible", amount: 40n },
+      ];
+      const mixedDecision = await runBatch(mixed, 100n, 0n);
+      assert.deepEqual(
+        mixedDecision.verdicts.map((verdict) => verdict.kind),
+        ["admissible", "admissible", "admissible"],
+      );
+      assert.equal(mixedDecision.totalEstimatedResourceFee, 30n);
+
+      const overMixed = await runBatch(
+        [
+          { call: transferCall(60n), forced: "admissible", amount: 60n },
+          { call: nonTransferCall(), forced: "admissible", amount: null },
+          { call: transferCall(41n), forced: "admissible", amount: 41n },
+        ],
+        100n,
+        0n,
+      );
+      assert.deepEqual(
+        overMixed.verdicts.map((verdict) => verdict.kind),
+        ["admissible", "admissible", "blocked"],
+      );
+    });
+
+    it("never upgrades an individual blocked or undetermined member", async () => {
+      const members: Member[] = [
+        { call: transferCall(1n), forced: "blocked", amount: 1n },
+        { call: transferCall(60n), forced: "admissible", amount: 60n },
+        { call: transferCall(1n), forced: "undetermined", amount: 1n },
+        { call: transferCall(40n), forced: "admissible", amount: 40n },
+      ];
+      const decision = await runBatch(members, 100n, 0n);
+
+      assert.deepEqual(
+        decision.verdicts.map((verdict) => verdict.kind),
+        ["blocked", "admissible", "undetermined", "admissible"],
+      );
+      assert.equal(decision.admissible, false);
+      assert.equal(decision.kind, "blocked");
+      // The 60 + 40 transfers still stage to exactly the cap; neither is
+      // upgraded by the blocked or undetermined member around them.
+      assert.equal(decision.totalEstimatedResourceFee, 20n);
+    });
+
+    it("matches a seeded generator of mixed batches", async () => {
+      const rand = mulberry32(STAGING_SEED);
+
+      for (let iteration = 0; iteration < STAGING_ITERATIONS; iteration += 1) {
+        const windowCap = [0n, 1n, 10n, 100n, 1_000n][Math.floor(rand() * 5)]!;
+        const initialWindowSpent =
+          rand() < 0.5 ? 0n : randomUint(rand, Math.min(12, windowCap.toString(2).length + 1));
+        const length = 1 + Math.floor(rand() * 5);
+        let staged = 0n;
+        const members: Member[] = [];
+
+        for (let index = 0; index < length; index += 1) {
+          if (rand() < 0.2) {
+            members.push({ call: nonTransferCall(), forced: "admissible", amount: null });
+            continue;
+          }
+
+          const kindRoll = rand();
+          const forced: ForcedKind =
+            kindRoll < 0.15 ? "blocked" : kindRoll < 0.3 ? "undetermined" : "admissible";
+
+          let amount: bigint;
+          if (forced !== "admissible") {
+            amount = 1n;
+          } else {
+            const remaining = windowCap - initialWindowSpent - staged;
+            const boundaryRoll = rand();
+            if (boundaryRoll < 0.15) {
+              amount = remaining > 0n ? remaining - 1n : 0n;
+            } else if (boundaryRoll < 0.3) {
+              amount = remaining > 0n ? remaining : 0n;
+            } else if (boundaryRoll < 0.45) {
+              amount = remaining >= 0n ? remaining + 1n : 1n;
+            } else {
+              amount = randomUint(rand, 32) % 1_000n;
+            }
+          }
+
+          members.push({ call: transferCall(amount), forced, amount });
+
+          if (
+            forced === "admissible" &&
+            amount > 0n &&
+            windowCap > 0n &&
+            initialWindowSpent + staged + amount <= windowCap
+          ) {
+            staged += amount;
+          }
+        }
+
+        const expected = expectedVerdicts(members, windowCap, initialWindowSpent);
+
+        try {
+          const decision = await runBatch(members, windowCap, initialWindowSpent);
+          assert.deepEqual(
+            decision.verdicts.map((verdict) => verdict.kind),
+            expected.kinds,
+            "staged verdict kinds",
+          );
+          assert.equal(decision.totalEstimatedResourceFee, expected.fee, "admissible fee total");
+          assert.equal(
+            decision.admissible,
+            !expected.kinds.includes("blocked") && !expected.kinds.includes("undetermined"),
+            "batch must not upgrade a blocked/undetermined member",
+          );
+        } catch (error) {
+          assert.fail(
+            `${describeFailure(
+              STAGING_SEED,
+              iteration,
+              members,
+              windowCap,
+              initialWindowSpent,
+            )}\nexpected kinds: ${expected.kinds.join(", ")}\n${
+              error instanceof Error ? error.stack ?? error.message : String(error)
+            }`,
+          );
+        }
+      }
+    });
   });
 });

@@ -235,6 +235,30 @@ describe("resolveLogger", () => {
     assert.deepEqual(seen, [{ message: "agent-7: retrying", meta: { attempt: 1 } }]);
   });
 
+  it("redacts private keys, signer output, caller arguments, and raw payloads from metadata", () => {
+    const seen: GuardLogMeta[] = [];
+    const original: GuardLogMeta = {
+      safe: "kept",
+      privateKey: "private-key",
+      signerOutput: "signature",
+      rawPayload: { xdr: "payload" },
+      call: { contract: GUARD, fn: "transfer", args: ["caller-data"] },
+      nested: { visible: true, diagnosticEvents: [{ secret: "event" }] },
+    };
+    const logger = resolveLogger({ debug: (_message, meta) => meta && seen.push(meta) });
+
+    logger.debug("diagnostics", original);
+
+    assert.deepEqual(seen, [
+      {
+        safe: "kept",
+        call: { contract: GUARD, fn: "transfer" },
+        nested: { visible: true },
+      },
+    ]);
+    assert.equal(original.privateKey, "private-key", "redaction must not mutate caller metadata");
+  });
+
   it("drops levels the host did not implement instead of routing them elsewhere", () => {
     const seen: string[] = [];
     const logger = resolveLogger({ warn: (message) => seen.push(message) });
@@ -374,14 +398,19 @@ describe("injected logger receives the decision points", () => {
       guardAuth: { guard: GUARD, agent: Keypair.random() },
       pollAttempts: 1,
       pollIntervalMs: 0,
-      retry: { maxAttempts: 2, sleep: async () => {} },
+      retry: { maxAttempts: 2, sleep: async () => {}, random: () => 0.5 },
       logger: log.logger,
     });
 
     assert.ok(outcome instanceof InvokeRetryError);
     const retries = log.at("debug").filter((line) => line.message.startsWith("retrying invoke"));
     assert.equal(retries.length, 1, "one retry, one line");
-    assert.deepEqual(retries[0]!.meta, { attempt: 1, maxAttempts: 2, retryable: "stale_ledger_resource_limit" });
+    assert.deepEqual(retries[0]!.meta, {
+      attempt: 1,
+      maxAttempts: 2,
+      retryable: "stale_ledger_resource_limit",
+      delayMs: 50,
+    });
 
     const exhausted = log.at("warn");
     assert.equal(exhausted.length, 1);

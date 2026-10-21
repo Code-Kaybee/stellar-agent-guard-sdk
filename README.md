@@ -81,6 +81,11 @@ npm install stellar-agent-guard-sdk
 >   // use interceptor, cost pre-checker, etc.
 > }
 > ```
+>
+
+The full tested matrix — Node version, ESM/CJS behaviour, browser and bundler
+targets, plus the environments that are explicitly unsupported — is in
+[`docs/runtime-support.md`](docs/runtime-support.md).
 
 *(Or build locally from source with Node 24+)*
 
@@ -172,7 +177,10 @@ Both framework adapters wrap the same `PreFlightInterceptor` but expose differen
 | `admissible` | Passes through; the wrapped tool handler runs. | Returns `true`; the action is a candidate for execution. |
 | `blocked(reason)` | Halts the tool call and returns a `ToolMessage` carrying the contract `reason` and explanation; the tool handler never runs. | Returns `false`; the action is excluded from candidate execution. |
 | `undetermined(cause)` | Halts the tool call with a formatted `ToolMessage` (fails closed); the tool handler never runs. | Returns `false` (fails closed); the action is excluded from candidate execution. |
-| Mapping error (`toContractCall` returns `null`/malformed) | Halts with a formatted `ToolMessage` describing the mapping failure; the tool handler never runs. | Returns `false`; the action is excluded from candidate execution. |
+| Mapping failure (`toContractCall`/`toContractCalls` throws or returns a malformed call) | Halts with an error `ToolMessage` describing the mapping failure (reported to `onBlocked` as `undetermined`); the tool handler never runs. | Returns `false`; the action is excluded from candidate execution. |
+| Not fund-moving (`toContractCall` returns `null`) | Passes through untouched: `null` means "no funds move", not "allowed", so no verdict is invented. | Returns `true` for the same reason; the guard has no opinion. |
+
+Adapter callbacks (`onDecision`, `onBlocked`) are never awaited. A callback that throws, or returns a promise that rejects, is isolated — it is reported to the optional `blockedHookLogger` and can never resume a halted action or become an unhandled rejection (issue #313). Every adapter also accepts `signal` and `timeoutMs`, which are forwarded to the pre-flight check; an abort or a fired timeout yields the same fail-closed `undetermined` halt as any other enforcement failure (issue #315).
 
 
 #### Branded Address Types (v0.2.0+)
@@ -512,16 +520,34 @@ read `signal` as *stop soon and stop asking*, not *cancel the socket*.
 
 ### Bounding a check or an invoke (`signal` and `timeoutMs`)
 
-`check()`, `CostPreChecker.check()` and `invoke()` each accept two optional
-caller-owned bounds on the RPC calls they make:
+`check()`, `checkBatch()`, `CostPreChecker.check()` and `invoke()` each accept
+two optional caller-owned bounds on the RPC calls they make:
 
 - `signal?: AbortSignal` — your runtime's cancellation (a tool-loop deadline, a
   shutdown hook, a user's "stop"). An **already-aborted** signal returns before
-  any RPC call is issued.
+  any RPC call is issued. On a batch it stops the batch: no further call is
+  started, and every unfinished call is reported as fail-closed `undetermined`.
 - `timeoutMs?: number` — a per-RPC-call budget in milliseconds. It defaults to
   `DEFAULT_RPC_TIMEOUT_MS` (**30s**), because a network partition that leaves a
   guardrail call pending forever is a hang, not a fail-closed decision. Pass
   `timeoutMs: 0` to opt out and rely on `signal` alone.
+- `deadlineMs?: number` — **`invoke()` and `checkBatch()`**: one overall budget
+  for the whole action (for a batch: policy read plus every staged call). Expiry
+  is fail-closed and reported as an `RpcTimeoutError` with `deadline: true`; it
+  can never become an `allowed` outcome. On a batch, calls that never started are
+  `undetermined` rather than skipped. Pass `clock` to make the accounting
+  deterministic in tests. See `docs/api/invoke-pipeline.md`.
+
+**Concurrent identical checks are coalesced.** `PreFlightInterceptor` shares one
+in-flight discovery/enforcement run when the same call and config are checked at
+the same time, so an agent framework issuing duplicate tool checks in one
+planning turn does not pay for duplicate RPCs. This is not a cache: the entry is
+removed as soon as the run settles, including on failure or `undetermined`. Each
+waiter still applies its own `signal`/`timeoutMs` — one caller giving up never
+cancels a result another waiter is entitled to — while the shared run itself
+keeps the pipeline's default `DEFAULT_RPC_TIMEOUT_MS` bound. Checks that supply
+`onStep` keep their own run so each trace sees every event, and
+`coalesceInFlight: false` disables coalescing entirely.
 
 **The typed error is the same; where it surfaces is deliberately not.** A bound
 that fires raises one class, `RpcTimeoutError` (carrying `stage` and whether it
@@ -531,6 +557,7 @@ questions:
 | Call | Fired bound |
 | --- | --- |
 | `check()` / `CostPreChecker.check()` | the fail-closed `undetermined` **verdict** (`decision.error instanceof RpcTimeoutError`) — the guard reached no decision, which is what `undetermined` already means |
+| `checkBatch()` | `undetermined` verdicts for the call in flight and for every call that never started; the completed verdicts keep their own kind |
 | `invoke()` | `invoke`'s `error` **outcome** (`outcome.error instanceof RpcTimeoutError`) — the pipeline never reached broadcast |
 
 ```ts
@@ -749,8 +776,11 @@ network ID, invocation, nonce, expiration ledger, or transaction freshness.
 
 ### Typed errors and 0.1.x migration
 
-All SDK-owned errors now share a `GuardError` base. `invoke()` remains result-oriented:
-inspect `outcome.error` with `instanceof` when `outcome.kind === "error"`.
+All operational SDK errors share a `GuardError` base. Invalid caller input is the
+deliberate exception: `InvalidInputError` (and `InvalidFeeCeilingError`) extend
+`TypeError`, keeping programmer errors distinct from transport, signing and policy
+failures. `invoke()` remains result-oriented: inspect `outcome.error` with `instanceof`
+when `outcome.kind === "error"`.
 
 ```ts
 import {
@@ -808,17 +838,18 @@ const hb = await startHeartbeat({
   graceSecs: 150,              // optional pre-read: validated as interval <= grace/3
 });
 
-// on shutdown:
-await hb.stop();
+// on shutdown: request cancellation, wait up to 5s for the in-flight beat
+const stop = await hb.stop({ timeoutMs: 5_000 });
+if (!stop.settled) logger.warn(`heartbeat stop ${stop.reason}`);
 ```
 
-- The first beat fires immediately, then every `intervalMs` on a fixed cadence — a slow beat surfaces as lateness on the next one instead of pushing the whole schedule.
-- A beat later than `maxSkewMs` increments `hb.missedBeats` and is reported as `lateMs` in `onBeat`; alert on lateness, not only on failure. `hb.lastBeatAt` is the epoch ms of the last successful beat.
+- The first beat fires immediately, then every `intervalMs` on a fixed cadence — a slow beat surfaces as lateness on the next one instead of pushing the whole schedule. A submission that outlives several slots skips the stale ones instead of firing a catch-up burst.
+- A beat later than `maxSkewMs` increments `hb.missedBeats` and is reported as `lateMs` in `onBeat`; each cadence slot skipped while a submission was in flight is counted too. Alert on lateness, not only on failure. `hb.lastBeatAt` is the epoch ms of the last successful beat.
 - Every submission rejection goes to `onError`; nothing escapes as an unhandled rejection.
-- `stop()` (or the `signal`) tears down cleanly: no beat is sent after it, and it resolves once an in-flight beat has settled.
+- `stop()` (or the `signal`) tears down cleanly: no beat is sent after it, and by default it resolves once an in-flight beat has settled. `stop()` first aborts the submission context's `signal`; pass `stop({ timeoutMs })` or set `stopTimeoutMs` when a custom transport might not settle, and inspect `{ reason, settled }` on the result.
 - When the grace window is readable (`graceSecs`, or a `readPolicy` read), an interval longer than `grace / 3` throws `HeartbeatIntervalError` **before** the first beat; an unreadable policy warns via `onWarning` and starts anyway.
 - A beat that would fall in the same wall-clock second as the previous accepted one is skipped client-side; the contract deduplicates independently.
-- Every input is validated **before** the scheduler starts: a negative or non-finite `maxSkewMs`, a grace window that is not a non-negative safe integer or bigint, a callback that is not callable, or an unusable retry budget is rejected with an error naming the field — before the first beat, and before the grace window is even read from the chain.
+- Every input is validated **before** the scheduler starts: a negative or non-finite `maxSkewMs`, a negative or non-finite `stopTimeoutMs`, a grace window that is not a non-negative safe integer or bigint, a callback that is not callable, or an unusable retry budget is rejected with an error naming the field — before the first beat, and before the grace window is even read from the chain.
 
 #### Bounded retry for a transient outage
 
@@ -840,6 +871,10 @@ const hb = await startHeartbeat({
 - The delay before the next attempt is a full-jitter sample of a bounded window, so agents that hit the same outage do not retry in a synchronized herd.
 - The attempt that failed and the delay before the next one are announced through `onWarning`; the failure that ends the beat is reported once through `onError`, with the original error. A successful beat reports how many attempts it took in `onBeat`'s `attempt`.
 
+#### Stopping with an in-flight submission
+
+A custom `submit(beat, { signal })` receives an `AbortSignal` that `stop()` aborts before waiting. The default is still graceful: `stop()` waits for the submission promise to settle, so a transport that honours the signal shuts down promptly. If the transport may never settle, bound the wait with `stop({ timeoutMs })` (or `stopTimeoutMs` on `startHeartbeat`); a fired bound returns `{ reason: "timeout", settled: false }`, while a graceful settle returns the in-flight submission's value or terminal error. No deadline is applied unless you ask for one.
+
 The combined heartbeat-loop + pre-flight pattern is tracked as an integration guide in [#74](https://github.com/Stellar-Agent-Guard/stellar-agent-guard-sdk/issues/74).
 
 ## API Reference
@@ -849,15 +884,16 @@ The combined heartbeat-loop + pre-flight pattern is tracked as an integration gu
 ### Interception & Execution
 
 - `PreFlightInterceptor`
-  - `constructor(options: PreFlightInterceptorOptions)` — Pass `cache: { ttlMs }` or `cache: { ttlLedgers }` to opt into the short-lived cache; omit it for fresh simulations.
+  - `constructor(options: PreFlightInterceptorOptions)` — Pass `cache: { ttlMs }` or `cache: { ttlLedgers }` to opt into the short-lived cache; omit it for fresh simulations. Concurrent identical `check()` calls share one in-flight run by default; pass `coalesceInFlight: false` to disable that.
   - `check(call: ContractCall, options?: PreFlightCheckOptions): Promise<PreFlightDecision>` — Returns `admissible | blocked | undetermined` without throwing or broadcasting. `options.signal` / `options.timeoutMs` bound the RPC calls it makes; a fired bound returns the fail-closed `undetermined` verdict carrying a typed `RpcTimeoutError` — see [Bounding a check or an invoke](#bounding-a-check-or-an-invoke-signal-and-timeoutms).
+  - `checkBatch(calls: ContractCall[], options?: CheckBatchOptions): Promise<PreFlightBatchDecision>` — Returns one verdict per call with all-or-nothing `admissible` semantics. `options.signal` bounds the whole batch, `options.deadlineMs` sets one overall budget, and `options.timeoutMs` stays per-call. A cancelled or over-budget batch stops before the next call and reports every unfinished call as `undetermined`.
   - `assertAllowed(call: ContractCall): Promise<AdmissibleDecision>` — Asserts allowed or throws `GuardBlockedError`.
+  - `checkBatch(calls, options?): Promise<PreFlightBatchDecision>` — Stages SAC transfer amounts against the rolling window and returns an `undetermined` batch verdict when a required policy/window read fails instead of assuming zero spend. `assertBatchAllowed()` is the throw-on-refusal form.
   - `invalidate(call?: ContractCall): void` — Clears all cached decisions or only entries for one call.
 - `CostPreChecker`
   - `constructor(config: CostPreCheckConfig)` — Accepts `interceptor`, optional `maxFeeStroops`, and optional `policySource` (contract address or `GuardPolicy`).
   - `check(call: ContractCall, options?: CostPreCheckOptions): Promise<CostPreCheckResult>` — Returns `within_budget | over_budget | blocked | undetermined` with additive `policyContext`.
-  - `checkWithCost(call: ContractCall): Promise<{ decision, cost }>` — Returns the interceptor verdict and the cost of the **same** single simulation. Prefer this over calling `check()` on both classes.
-- `invoke(options: InvokeOptions): Promise<InvokeResult>` — End-to-end pipeline: probe, sign auth, simulate, and broadcast. Accepts an optional `onStep(step: InvokeStepEvent)` hook reporting per-stage `start`/`ok`/`fail` timing events with a 0-based retry `attempt` index; callback exceptions are isolated and omitting the hook changes nothing. `options.signal` / `options.timeoutMs` stop a stalled run: the bound is reported through `invoke`'s `error` outcome as a typed `RpcTimeoutError`.
+  - `checkWithCost(call: ContractCall): Promise<{ decision, cost }>` — Returns the interceptor verdict and the cost of the **same** single simulation. Prefer this over calling `check()` on both classes.  - `invoke(options: InvokeOptions): Promise<InvokeResult>` — End-to-end pipeline: probe, sign auth, simulate, and broadcast. Accepts an optional `onStep(step: InvokeStepEvent)` hook reporting per-stage `start`/`ok`/`fail` timing events with a 0-based retry `attempt` index; callback exceptions are isolated and omitting the hook changes nothing. `options.signal` / `options.timeoutMs` stop a stalled run; `options.deadlineMs` bounds the whole action including retries and polling. Either bound is reported through `invoke`'s `error` outcome as a typed `RpcTimeoutError`. Terminal outcomes also carry additive `retry` metadata (attempt count, retryable classes, delays and exhaustion) with no payloads or XDR.
 - `startHeartbeat(options): Promise<HeartbeatHandle>` — Drift-aware dead-man keep-alive. Fires `heartbeat()` on an interval, reports lateness (`handle.missedBeats`, `onBeat`'s `lateMs`), routes every failure to `onError`, validates `interval <= grace/3` before the first beat when the grace window is readable, and stops cleanly (`await handle.stop()`). See “Keep the dead-man switch alive”.
 - `submitHeartbeat(params): Promise<HeartbeatSubmission>` — Signs and submits a single `heartbeat()` with the agent's guard authorization; the default submission `startHeartbeat` uses.
 - `HeartbeatBlockedError` / `isRetryableHeartbeatFailure(error)` — The typed refusal of a blocked heartbeat, and the classifier that decides whether a failure is a transport failure (retryable) or a decision (never retried). See [Bounded retry for a transient outage](#bounded-retry-for-a-transient-outage).
@@ -885,17 +921,18 @@ const hb = await startHeartbeat({
   graceSecs: 150,              // optional pre-read: validated as interval <= grace/3
 });
 
-// on shutdown:
-await hb.stop();
+// on shutdown: request cancellation, wait up to 5s for the in-flight beat
+const stop = await hb.stop({ timeoutMs: 5_000 });
+if (!stop.settled) logger.warn(`heartbeat stop ${stop.reason}`);
 ```
 
-- The first beat fires immediately, then every `intervalMs` on a fixed cadence — a slow beat surfaces as lateness on the next one instead of pushing the whole schedule.
-- A beat later than `maxSkewMs` increments `hb.missedBeats` and is reported as `lateMs` in `onBeat`; alert on lateness, not only on failure. `hb.lastBeatAt` is the epoch ms of the last successful beat.
+- The first beat fires immediately, then every `intervalMs` on a fixed cadence — a slow beat surfaces as lateness on the next one instead of pushing the whole schedule. A submission that outlives several slots skips the stale ones instead of firing a catch-up burst.
+- A beat later than `maxSkewMs` increments `hb.missedBeats` and is reported as `lateMs` in `onBeat`; each cadence slot skipped while a submission was in flight is counted too. Alert on lateness, not only on failure. `hb.lastBeatAt` is the epoch ms of the last successful beat.
 - Every submission rejection goes to `onError`; nothing escapes as an unhandled rejection.
-- `stop()` (or the `signal`) tears down cleanly: no beat is sent after it, and it resolves once an in-flight beat has settled.
+- `stop()` (or the `signal`) tears down cleanly: no beat is sent after it, and by default it resolves once an in-flight beat has settled. `stop()` first aborts the submission context's `signal`; pass `stop({ timeoutMs })` or set `stopTimeoutMs` when a custom transport might not settle, and inspect `{ reason, settled }` on the result.
 - When the grace window is readable (`graceSecs`, or a `readPolicy` read), an interval longer than `grace / 3` throws `HeartbeatIntervalError` **before** the first beat; an unreadable policy warns via `onWarning` and starts anyway.
 - A beat that would fall in the same wall-clock second as the previous accepted one is skipped client-side; the contract deduplicates independently.
-- Every input is validated **before** the scheduler starts: a negative or non-finite `maxSkewMs`, a grace window that is not a non-negative safe integer or bigint, a callback that is not callable, or an unusable retry budget is rejected with an error naming the field — before the first beat, and before the grace window is even read from the chain.
+- Every input is validated **before** the scheduler starts: a negative or non-finite `maxSkewMs`, a negative or non-finite `stopTimeoutMs`, a grace window that is not a non-negative safe integer or bigint, a callback that is not callable, or an unusable retry budget is rejected with an error naming the field — before the first beat, and before the grace window is even read from the chain.
 
 #### Bounded retry for a transient outage
 
@@ -917,6 +954,10 @@ const hb = await startHeartbeat({
 - The delay before the next attempt is a full-jitter sample of a bounded window, so agents that hit the same outage do not retry in a synchronized herd.
 - The attempt that failed and the delay before the next one are announced through `onWarning`; the failure that ends the beat is reported once through `onError`, with the original error. A successful beat reports how many attempts it took in `onBeat`'s `attempt`.
 
+#### Stopping with an in-flight submission
+
+A custom `submit(beat, { signal })` receives an `AbortSignal` that `stop()` aborts before waiting. The default is still graceful: `stop()` waits for the submission promise to settle, so a transport that honours the signal shuts down promptly. If the transport may never settle, bound the wait with `stop({ timeoutMs })` (or `stopTimeoutMs` on `startHeartbeat`); a fired bound returns `{ reason: "timeout", settled: false }`, while a graceful settle returns the in-flight submission's value or terminal error. No deadline is applied unless you ask for one.
+
 The combined heartbeat-loop + pre-flight pattern is tracked as an integration guide in [#74](https://github.com/Stellar-Agent-Guard/stellar-agent-guard-sdk/issues/74).
 
 ## API Reference
@@ -935,6 +976,7 @@ one-shot form.
   - `constructor(options: GuardTelemetryListenerOptions)`
   - `watch(params?: GuardTelemetryWatchParams): AsyncIterable<GuardEventPage>` — Tails on-chain and uncommitted events. `params.signal` aborts at loop boundaries: no RPC call before the first pull, no poll after an abort, and the delay between polls is cut short. A request already in flight cannot be cancelled — see [Aborting a watch](#aborting-a-watch-what-cancellation-does-and-does-not-cover).
   - `watchAll(params?: GuardTelemetryUnifiedParams): AsyncIterable<GuardEvent>` — Merges the committed ledger stream with the `diagnostics` batches you feed it into **one ordered, de-duplicated stream**, so a single loop sees blocked decisions too. Each event carries `stream: 'committed' | 'diagnostic'` and, for diagnostics, `observedAt`. Ordering and de-duplication rules: [`docs/event-schema.md`](docs/event-schema.md).
+  - `health(): GuardTelemetryHealthSnapshot` — Read-only operational snapshot: stream state (`idle`/`running`/`recovering`/`stopped`/`aborted`/`failed`), last successful poll, consecutive failures, per-stream cursors, failed-tx degradation, and known coverage gaps. Every field is a copy. Contract: [`docs/api/telemetry-listener.md`](docs/api/telemetry-listener.md#health-guardtelemetryhealthsnapshot).
   - `serializeEvent(event: GuardEvent): string` — Canonical single-line JSON for deterministic JSON-lines log shipping. Fixed key order, drops `undefined`, keeps `null`, renders `bigint` as a decimal string. Contract: [`docs/event-schema.md`](docs/event-schema.md#canonical-json-serialization--serializeevent).
 - `validateGuardPolicy(policy: unknown, options?: ValidatePolicyOptions | string): PolicyFailure[]` — Validates policy configuration against SPEC §8 rules prior to broadcast, accumulating all failures for complete form UX.
 - `POLICY_RULE_IDS` — Canonical array of SPEC §8 validation rule identifiers.
@@ -978,6 +1020,8 @@ const recentWindow = listener.recent({ fromLedger: 4_700_000 });
 `recent(filter?)` returns the retained events oldest-first, filtered by any of `stream`, `reason`, `fromLedger`, `toLedger`. The buffer is FIFO and non-durable: it holds only what this listener decoded in this process, and a restart empties it. Persistence across restarts is a cursor store (tracked separately), not something this buffer pretends to provide.
 
 What it returns is a **detached snapshot**: the array, the events in it, their decoded `data`/`decision` and the opt-in `raw` payload are all copies, so editing a returned event cannot change what the listener still retains. A listener with no `buffer` configured copies nothing — `recent()` returns `[]`.
+
+`recentJsonLines(filter?)` returns the same bounded window as **JSON Lines** (issue #324) — one `serializeEventRecord()` line per event, oldest first, `filter` applied identically. It returns a string and never touches the filesystem; `bigint` values are decimal strings and byte arrays are `bytes:<hex>`, so the export parses without the SDK. The opt-in `raw` payload is never included: the projection is a fixed field list, so an incident bundle cannot leak a retained debug payload.
 
 #### Raw events for bug reports (issue #94)
 
@@ -1138,6 +1182,7 @@ This boundary is an inherent property of the platform (the auth context does not
 - GitHub issues: <https://github.com/aigbagbobila/stellar-agent-guard-sdk/issues>
 - Maintainer (GitHub): [@aigbagbobila](https://github.com/aigbagbobila)
 - Security disclosures: see the local [SECURITY.md](SECURITY.md) for SDK issues; contract/protocol issues and deployed-instance incidents go to the contracts repo's [SECURITY.md](https://github.com/aigbagbobila/stellar-agent-guard-contracts/blob/main/SECURITY.md)
+- Security review: [`docs/attack-surface.md`](docs/attack-surface.md) maps where untrusted data enters and leaves the SDK, and [`docs/threat-model.md`](docs/threat-model.md) states what can go wrong
 
 ## License
 
