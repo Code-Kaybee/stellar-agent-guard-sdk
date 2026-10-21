@@ -256,7 +256,7 @@ async function runSecretScan(): Promise<number> {
         : secret.lineContent;
 
       console.log(`   Line ${secret.lineNumber}: ${secret.matchedPattern}`);
-      console.log(`   Content: ${displayLine.replace(/[^\x00-\x7F]/g, ".")}`); // Replace non-ASCII to avoid display issues
+      console.log(`   Content: ${displayLine.replace(/[^\x20-\x7E]/g, ".")}`); // Replace non-printable/non-ASCII to avoid display issues
       console.log();
     }
   }

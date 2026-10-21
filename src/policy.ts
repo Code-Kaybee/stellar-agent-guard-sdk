@@ -971,7 +971,7 @@ export async function fetchGuardPolicyAndWindow(
       try {
         // Use existing decodePolicy function for proper validation
         policy = decodePolicy(policyEntryResult.value as xdr.ScVal);
-      } catch (e) {
+      } catch {
         // If decoding fails, policy remains null (distinguishable from valid policy)
         policy = null;
       }
@@ -1000,14 +1000,14 @@ export async function fetchGuardPolicyAndWindow(
         // Note: This maintains backward compatibility where 0n means either "no window" or "zero spent"
         // To properly distinguish, we would need to change the return type, which is not done here
         // to maintain backward compatibility
-      } catch (e) {
+      } catch {
         // If validation fails, windowSpent remains 0n
         // Note: Same limitation as above regarding distinguishing missing vs zero
       }
     }
 
     return { policy, windowSpent };
-  } catch (e) {
+  } catch {
     // If single call fails, fall back to separate calls for backward compatibility
     const [policyEntry, windowEntry] = await Promise.all([
       readPersistentEntry(server, guard, "Policy"),
@@ -1018,7 +1018,7 @@ export async function fetchGuardPolicyAndWindow(
     if (policyEntry?.value && typeof policyEntry.value === "object") {
       try {
         policy = decodePolicy(policyEntry.value as xdr.ScVal);
-      } catch (e) {
+      } catch {
         policy = null;
       }
     }
@@ -1040,7 +1040,7 @@ export async function fetchGuardPolicyAndWindow(
             }
           }
         }
-      } catch (e) {
+      } catch {
         // windowSpent remains 0n
       }
     }
